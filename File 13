@@ -1,0 +1,62 @@
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+np.random.seed(42)
+
+n_samples = 1000
+
+data = {
+    'Depth (m)': np.random.uniform(1, 30, n_samples),
+    'Water Table Depth (m)': np.random.uniform(0.5, 25, n_samples),
+    'CPT Tip Resistance (MPa)': np.random.uniform(0.5, 20, n_samples),
+    'Soil Unit Weight (kN/m3)': np.random.uniform(14, 22, n_samples),
+    'Shear Stress Ratio': np.random.uniform(0.1, 1.5, n_samples),
+    'Peak Ground Acceleration (g)': np.random.uniform(0.1, 0.6, n_samples),
+}
+
+df = pd.DataFrame(data)
+
+df['Liquefied'] = (
+    (df['CPT Tip Resistance (MPa)'] < 5) &
+    (df['Shear Stress Ratio'] > 1.0) &
+    (df['Peak Ground Acceleration (g)'] > 0.3)
+).astype(int)
+
+X = df.drop('Liquefied', axis=1)
+y = df['Liquefied']
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+models = {
+    'Decision Tree': DecisionTreeClassifier(random_state=42),
+    'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
+    'Gradient Boosting': GradientBoostingClassifier(n_estimators=100, random_state=42),
+}
+
+results = {}
+
+for name, model in models.items():
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+
+    acc = accuracy_score(y_test, y_pred)
+    results[name] = acc
+
+    print(f"--- {name} ---")
+    print(confusion_matrix(y_test, y_pred))
+    print(classification_report(y_test, y_pred))
+    print()
+
+plt.figure(figsize=(8, 4))
+sns.barplot(x=list(results.keys()), y=list(results.values()))
+plt.ylabel("Accuracy")
+plt.title("Tree-Based Model Comparison for Soil Liquefaction Prediction")
+plt.ylim(0, 1)
+plt.grid(True, axis='y', linestyle='--', alpha=0.7)
+plt.tight_layout()
+plt.show()
