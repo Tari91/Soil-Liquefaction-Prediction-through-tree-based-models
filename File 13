@@ -1,62 +1,305 @@
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, ExtraTreesClassifier
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, roc_auc_score, precision_recall_curve, auc
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.utils import resample
+import os
 
-np.random.seed(42)
+# Function to generate synthetic data for soil liquefaction
+def generate_synthetic_data(n_samples=1000, features_range=None):
+    """
+    Generates synthetic data for soil liquefaction prediction.
 
-n_samples = 1000
+    Args:
+        n_samples (int, optional): The number of samples to generate. Defaults to 1000.
+        features_range (dict, optional): Dictionary specifying the range (min, max) for each feature.
+            If None, default ranges are used.
+            Example:
+            features_range = {
+                'SPT_N_value': (5, 50),
+                'Fines_content': (0, 100),
+                'Plasticity_index': (0, 30),
+                'Clay_content': (0, 40),
+                'Depth': (1, 20),
+                'Peak_ground_acceleration': (0.1, 1.0),
+                'Groundwater_table': (0, 5),
+                'Magnitude': (5, 9)
+            }
 
-data = {
-    'Depth (m)': np.random.uniform(1, 30, n_samples),
-    'Water Table Depth (m)': np.random.uniform(0.5, 25, n_samples),
-    'CPT Tip Resistance (MPa)': np.random.uniform(0.5, 20, n_samples),
-    'Soil Unit Weight (kN/m3)': np.random.uniform(14, 22, n_samples),
-    'Shear Stress Ratio': np.random.uniform(0.1, 1.5, n_samples),
-    'Peak Ground Acceleration (g)': np.random.uniform(0.1, 0.6, n_samples),
-}
+    Returns:
+        pd.DataFrame: A DataFrame containing the synthetic data.
+    """
+    if features_range is None:
+        features_range = {
+            'SPT_N_value': (5, 50),  # Standard Penetration Test N-value (blows/ft) - Integer
+            'Fines_content': (0, 100),  # Percentage of fine-grained particles (%) - Float
+            'Plasticity_index': (0, 30),  # Plasticity Index of soil - Integer
+            'Clay_content': (0, 40), # Percentage of Clay Content
+            'Depth': (1, 20),  # Depth below ground surface (meters) - Float
+            'Peak_ground_acceleration': (0.1, 1.0),  # Peak ground acceleration (g) - Float
+            'Groundwater_table': (0, 5),  # Depth of groundwater table (meters) - Float
+            'Magnitude': (5, 9) # Earthquake Magnitude
+        }
 
-df = pd.DataFrame(data)
+    data = {}
+    for feature, (min_val, max_val) in features_range.items():
+        if feature in ['SPT_N_value', 'Plasticity_index']:  # Integer features
+            data[feature] = np.random.randint(min_val, max_val + 1, n_samples)
+        else:
+            data[feature] = np.random.uniform(min_val, max_val, n_samples)
 
-df['Liquefied'] = (
-    (df['CPT Tip Resistance (MPa)'] < 5) &
-    (df['Shear Stress Ratio'] > 1.0) &
-    (df['Peak Ground Acceleration (g)'] > 0.3)
-).astype(int)
+    df = pd.DataFrame(data)
 
-X = df.drop('Liquefied', axis=1)
-y = df['Liquefied']
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    #  Calculate the Cyclic Stress Ratio (CSR) - a simplified version
+    #  CSR is generally calculated using more complex formulas involving depth, stress reduction coefficient, etc.
+    df['CSR'] = 0.65 * (df['Peak_ground_acceleration'] / 9.81) * (1 - (df['Depth'] / 20)) * df['Magnitude'] # A simplified CSR calculation
 
-models = {
-    'Decision Tree': DecisionTreeClassifier(random_state=42),
-    'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
-    'Gradient Boosting': GradientBoostingClassifier(n_estimators=100, random_state=42),
-}
+    # Calculate the Cyclic Resistance Ratio (CRR) - a simplified version
+    #  CRR is influenced by SPT N-value and fines content.
+    df['CRR'] = (df['SPT_N_value'] / 100) + (df['Fines_content'] / 500)  # Simplified CRR
 
-results = {}
+    # Determine liquefaction based on a simplified comparison of CSR and CRR
+    #  A more accurate model would involve a factor of safety and probabilistic calculations.
+    df['Liquefaction'] = (df['CSR'] > df['CRR']).astype(int)
 
-for name, model in models.items():
+    # Add some noise to the features to make it more realistic
+    for feature in features_range:
+        if feature not in ['Liquefaction']:
+            noise = np.random.normal(0, (max(features_range[feature]) - min(features_range[feature])) * 0.05, n_samples)  # Noise scaled to feature range
+            df[feature] = df[feature] + noise
+            # Clip the values to stay within the defined range
+            df[feature] = np.clip(df[feature], features_range[feature][0], features_range[feature][1])
+
+    # Ensure SPT_N_value and Plasticity_index are integers after adding noise
+    df['SPT_N_value'] = np.round(df['SPT_N_value']).astype(int)
+    df['Plasticity_index'] = np.round(df['Plasticity_index']).astype(int)
+
+    return df
+
+# Function to preprocess the data
+def preprocess_data(df, scaling=True, handle_imbalance='none', test_size=0.2):
+    """
+    Preprocesses the data for model training.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame.
+        scaling (bool, optional): Whether to scale the features. Defaults to True.
+        handle_imbalance (str, optional): Method to handle class imbalance ('none', 'oversample', 'undersample').
+            Defaults to 'none'.
+        test_size (float, optional): The proportion of the dataset to use for testing. Defaults to 0.2.
+
+    Returns:
+        tuple: A tuple containing the training and testing sets (X_train, X_test, y_train, y_test).
+    """
+    # Separate features and target variable
+    X = df.drop('Liquefaction', axis=1)
+    y = df['Liquefaction']
+
+    # Impute missing values using the median (robust to outliers)
+    imputer = SimpleImputer(strategy='median')
+    X_imputed = pd.DataFrame(imputer.fit_transform(X), columns=X.columns)
+
+    # Split data into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X_imputed, y, test_size=test_size, random_state=42, stratify=y) # Added stratify
+
+    # Feature scaling
+    if scaling:
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train)
+        X_test = scaler.transform(X_test)
+
+    X_train_df = pd.DataFrame(X_train, columns=X.columns) # Convert back to DataFrame for easier handling
+    X_test_df = pd.DataFrame(X_test, columns=X.columns)
+
+    # Handle class imbalance
+    if handle_imbalance == 'oversample':
+        X_train_resampled, y_train_resampled = oversample(X_train_df, y_train)
+        return X_train_resampled, X_test_df, y_train_resampled, y_test
+    elif handle_imbalance == 'undersample':
+        X_train_resampled, y_train_resampled = undersample(X_train_df, y_train)
+        return X_train_resampled, X_test_df, y_train_resampled, y_test
+    else:
+        return X_train_df, X_test_df, y_train, y_test
+
+# Function to handle class imbalance using oversampling
+def oversample(X_train, y_train):
+    """
+    Oversamples the minority class using SMOTE.
+
+    Args:
+        X_train (pd.DataFrame): The training features.
+        y_train (pd.Series): The training target variable.
+
+    Returns:
+        tuple: The oversampled training features and target variable.
+    """
+    # Combine training data for resampling
+    train_data = pd.concat([X_train, y_train], axis=1)
+    # Separate majority and minority classes
+    majority_class = train_data[train_data['Liquefaction'] == 0]
+    minority_class = train_data[train_data['Liquefaction'] == 1]
+
+    # Upsample minority class
+    minority_upsampled = resample(minority_class,
+                                 replace=True,  # Sample with replacement
+                                 n_samples=len(majority_class),  # to match majority class
+                                 random_state=42)  # reproducible results
+
+    # Combine majority class with upsampled minority class
+    upsampled_data = pd.concat([majority_class, minority_upsampled])
+
+    # Separate features and target variable
+    X_train_resampled = upsampled_data.drop('Liquefaction', axis=1)
+    y_train_resampled = upsampled_data['Liquefaction']
+
+    return X_train_resampled, y_train_resampled
+
+# Function to handle class imbalance using undersampling
+def undersample(X_train, y_train):
+    """
+    Undersamples the majority class.
+
+    Args:
+        X_train (pd.DataFrame): The training features.
+        y_train (pd.Series): The training target variable.
+
+    Returns:
+        tuple: The undersampled training features and target variable.
+    """
+    # Combine training data for resampling
+    train_data = pd.concat([X_train, y_train], axis=1)
+
+    # Separate majority and minority classes
+    majority_class = train_data[train_data['Liquefaction'] == 0]
+    minority_class = train_data[train_data['Liquefaction'] == 1]
+
+    # Downsample majority class
+    majority_downsampled = resample(majority_class,
+                                 replace=False,    # Sample without replacement
+                                 n_samples=len(minority_class),  # to match minority class
+                                 random_state=42)  # reproducible results
+
+    # Combine minority class with downsampled majority class
+    downsampled_data = pd.concat([majority_downsampled, minority_class])
+
+    # Separate features and target variable
+    X_train_resampled = downsampled_data.drop('Liquefaction', axis=1)
+    y_train_resampled = downsampled_data['Liquefaction']
+    return X_train_resampled, y_train_resampled
+
+# Function to train and evaluate a model
+def train_and_evaluate_model(model, X_train, y_train, X_test, y_test, model_name='Model', cv=5):
+    """
+    Trains and evaluates a given model.
+
+    Args:
+        model (estimator): The machine learning model to train.
+        X_train (pd.DataFrame): The training features.
+        y_train (pd.Series): The training target variable.
+        X_test (pd.DataFrame): The testing features.
+        y_test (pd.Series): The testing target variable.
+        model_name (str, optional): Name of the model for display. Defaults to 'Model'.
+        cv (int, optional): Number of cross-validation folds. Defaults to 5.
+
+    Returns:
+        tuple: A tuple containing the trained model, and evaluation metrics (accuracy, confusion matrix,
+               classification report, AUC-ROC, precision-recall curve data).
+    """
+    # Train the model
     model.fit(X_train, y_train)
+
+    # Make predictions
     y_pred = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)[:, 1]  # Probability of positive class
 
-    acc = accuracy_score(y_test, y_pred)
-    results[name] = acc
+    # Evaluate the model
+    accuracy = accuracy_score(y_test, y_pred)
+    conf_matrix = confusion_matrix(y_test, y_pred)
+    class_report = classification_report(y_test, y_pred)
+    auc_roc = roc_auc_score(y_test, y_prob)
 
-    print(f"--- {name} ---")
-    print(confusion_matrix(y_test, y_pred))
-    print(classification_report(y_test, y_pred))
-    print()
+    # Precision-Recall Curve
+    precision, recall, _ = precision_recall_curve(y_test, y_prob)
+    auc_pr = auc(recall, precision) # Calculate AUC for PR curve
 
-plt.figure(figsize=(8, 4))
-sns.barplot(x=list(results.keys()), y=list(results.values()))
-plt.ylabel("Accuracy")
-plt.title("Tree-Based Model Comparison for Soil Liquefaction Prediction")
-plt.ylim(0, 1)
-plt.grid(True, axis='y', linestyle='--', alpha=0.7)
-plt.tight_layout()
-plt.show()
+    # Cross-validation (optional, for more robust evaluation)
+    cv_scores = cross_val_score(model, X_train, y_train, cv=cv, scoring='roc_auc')  # Use AUC-ROC for CV
+    print(f"{model_name} Cross-Validation AUC-ROC Scores: {cv_scores}")
+    print(f"{model_name} Mean CV AUC-ROC Score: {np.mean(cv_scores):.4f}")
+
+    print(f"{model_name} Accuracy: {accuracy:.4f}")
+    print(f"{model_name} AUC-ROC: {auc_roc:.4f}")
+    print(f"{model_name} AUC-PR: {auc_pr:.4f}") # Print AUC-PR
+
+    return model, accuracy, conf_matrix, class_report, auc_roc, (precision, recall, auc_pr)
+
+# Function to plot results
+def plot_results(conf_matrix, class_report, auc_roc, precision_recall_data, model_name='Model'):
+    """
+    Plots the confusion matrix, classification report, ROC curve, and Precision-Recall curve.
+
+    Args:
+        conf_matrix (np.ndarray): The confusion matrix.
+        class_report (str): The classification report.
+        auc_roc (float): The AUC-ROC score.
+        precision_recall_data (tuple): Precision, recall, and AUC-PR data.
+        model_name (str, optional): Name of the model for the plot title. Defaults to 'Model'.
+    """
+    # Confusion Matrix
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['No Liquefaction', 'Liquefaction'],
+                yticklabels=['No Liquefaction', 'Liquefaction'])
+    plt.title(f'{model_name} Confusion Matrix')
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.show()
+
+    # Classification Report
+    print(f'{model_name} Classification Report:\n{class_report}')
+
+    # ROC Curve
+    plt.figure(figsize=(8, 6))
+    plt.plot([0, 1], [0, 1], 'k--')
+    fpr, tpr, _ = roc_curve(y_test, y_prob) # Moved here to be defined before plotting
+    plt.plot(fpr, tpr, label=f'{model_name} (AUC = {auc_roc:.2f})')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(f'{model_name} ROC Curve')
+    plt.legend(loc='lower right')
+    plt.show()
+
+    # Precision-Recall Curve
+    precision, recall, auc_pr = precision_recall_data
+    plt.figure(figsize=(8, 6))
+    plt.plot(recall, precision, label=f'{model_name} (AUC-PR = {auc_pr:.2f})')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title(f'{model_name} Precision-Recall Curve')
+    plt.legend(loc='upper right')
+    plt.show()
+
+if __name__ == "__main__":
+    # Generate synthetic data
+    data_df = generate_synthetic_data(n_samples=2000) # Increased samples for better results
+
+    # Preprocess the data with oversampling
+    X_train, X_test, y_train, y_test = preprocess_data(data_df, scaling=True, handle_imbalance='oversample', test_size=0.2)
+
+    # Models to train
+    models = {
+        'Random Forest': RandomForestClassifier(random_state=42),
+        'Gradient Boosting': GradientBoostingClassifier(random_state=42),
+        'Extra Trees': ExtraTreesClassifier(random_state=42)
+    }
+
+    # Train and evaluate each model
+    for model_name, model in models.items():
+        trained_model, accuracy, conf_matrix, class_report, auc_roc, pr_data = train_and_evaluate_model(model, X_train, y_train, X_test, y_test, model_name=model_name)
+        plot_results(conf_matrix, class_report, auc_roc, pr_data, model_name=model_name)
+
