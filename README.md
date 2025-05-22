@@ -60,5 +60,5 @@ The synthetic data generator can be extended to reflect more complex field behav
 
 Intended for educational and prototyping purposes.
 
-📬 Contact
+📬 Author
 Tarinabo williamtarinabo@gmail.com
